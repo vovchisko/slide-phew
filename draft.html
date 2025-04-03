@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Canvas Recorder with Uploads</title>
+  <style>
+    body {
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      padding: 20px;
+    }
+    canvas {
+      border: 2px solid #fff;
+      background: #222;
+      display: block;
+      margin-top: 10px;
+    }
+    input, label {
+      margin: 0.5em 0;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <label>
+    Upload Images:
+    <input type="file" id="imageUpload" multiple accept="image/*">
+  </label>
+  <label>
+    Framerate (FPS):
+    <input type="number" id="fpsInput" value="30" min="1" max="60">
+  </label>
+  <button id="startBtn">Start Recording</button>
+  <canvas id="canvas" width="640" height="480"></canvas>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const fpsInput = document.getElementById('fpsInput');
+const imageUpload = document.getElementById('imageUpload');
+const startBtn = document.getElementById('startBtn');
+
+const duration = 5000; // 5 seconds
+let images = []; // { img, x, y, dx, dy }
+
+imageUpload.addEventListener('change', () => {
+  const files = Array.from(imageUpload.files);
+  images = [];
+
+  files.forEach(file => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const size = 60;
+        images.push({
+          img,
+          x: Math.random() * (canvas.width - size),
+          y: Math.random() * (canvas.height - size),
+          dx: (Math.random() - 0.5) * 4,
+          dy: (Math.random() - 0.5) * 4,
+          size
+        });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+});
+
+startBtn.addEventListener('click', () => {
+  const fps = parseInt(fpsInput.value) || 30;
+  const interval = 1000 / fps;
+
+  // Add default shapes if no images
+  if (images.length === 0) {
+    const defaultCanvas = document.createElement('canvas');
+    defaultCanvas.width = 60;
+    defaultCanvas.height = 60;
+    const dctx = defaultCanvas.getContext('2d');
+
+    dctx.fillStyle = 'orange';
+    dctx.fillRect(0, 0, 60, 60);
+    const square = new Image();
+    square.src = defaultCanvas.toDataURL();
+    images.push({ img: square, x: 100, y: 100, dx: 2, dy: 1.5, size: 60 });
+
+    dctx.clearRect(0, 0, 60, 60);
+    dctx.fillStyle = 'cyan';
+    dctx.beginPath();
+    dctx.moveTo(30, 0);
+    dctx.lineTo(60, 60);
+    dctx.lineTo(0, 60);
+    dctx.closePath();
+    dctx.fill();
+    const triangle = new Image();
+    triangle.src = defaultCanvas.toDataURL();
+    images.push({ img: triangle, x: 200, y: 200, dx: -1.2, dy: 2, size: 60 });
+  }
+
+  const stream = canvas.captureStream(fps);
+  const recorder = new MediaRecorder(stream);
+  const chunks = [];
+
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'canvas_recording.webm';
+    a.click();
+  };
+
+  let elapsed = 0;
+  recorder.start();
+
+  const timer = setInterval(() => {
+    elapsed += interval;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    for (let obj of images) {
+      obj.x += obj.dx;
+      obj.y += obj.dy;
+
+      // Bounce off edges
+      if (obj.x < 0 || obj.x + obj.size > canvas.width) obj.dx *= -1;
+      if (obj.y < 0 || obj.y + obj.size > canvas.height) obj.dy *= -1;
+
+      ctx.drawImage(obj.img, obj.x, obj.y, obj.size, obj.size);
+    }
+
+    if (elapsed >= duration) {
+      clearInterval(timer);
+      recorder.stop();
+    }
+  }, interval);
+});
+</script>
+</body>
+</html>
