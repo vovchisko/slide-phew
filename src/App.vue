@@ -48,7 +48,7 @@
             <option value="24">24</option>
             <option value="30">30</option>
             <option value="60">60</option>
-            <option value="120">120</option>
+            <option value="120">120 (experimental)</option>
           </select>
         </div>
         
