@@ -163,12 +163,12 @@ let animationFrame = null
 
 // Group video settings into a single reactive object
 const videoSettings = reactive({
-  fps: 30,
+  fps: 24,
   width: 500,
   height: 500,
   aspectRatio: 'square', // 'square' (1:1), 'landscape' (2:1) or 'portrait' (1:2)
   duration: 5,
-  transitionTime: 0.5,
+  transitionTime: 0.33,
   format: 'mp4' // mp4 only
 })
 
