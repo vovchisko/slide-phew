@@ -48,6 +48,7 @@
             <option value="24">24</option>
             <option value="30">30</option>
             <option value="60">60</option>
+            <option value="120">120</option>
           </select>
         </div>
         
@@ -670,88 +671,120 @@ async function startRecording() {
 }
 
 async function encodeVideo(frameCount, fps) {
-  // Create input.txt for concat demuxer
-  const fileList = Array.from({length: frameCount}, (_, i) => 
-    `file frame_${i.toString().padStart(5, '0')}.jpg`
-  ).join('\n')
-  
-  await ffmpeg.writeFile('input.txt', fileList)
-  
+  // No longer need to create input.txt
+
   recordingStats.status = 'encoding'
   console.log(`Encoding ${frameCount} frames at ${fps} FPS`)
-  
+
   const outputFile = 'output.mp4'
-  
+
   try {
-    // Use more explicit timing controls for FFmpeg
+    // Use the image2 demuxer for image sequences
     await ffmpeg.exec([
-      '-f', 'concat', 
-      '-safe', '0',
-      '-i', 'input.txt',
-      // Force exact framerate with CFR
+      // *** Specify input framerate BEFORE input for image sequences ***
       '-framerate', `${fps}`,
+      // *** Input using image2 pattern matching frame names ***
+      '-i', `frame_%05d.jpg`,
+      // Output frame rate and sync options
       '-r', `${fps}`,
-      '-vsync', 'cfr',
+      '-vsync', 'cfr', // Constant Frame Rate
+      // Video codec settings (adjust as needed)
       '-c:v', 'libx264',
       '-profile:v', 'high',
-      '-preset', 'ultrafast',
-      '-tune', 'zerolatency',
-      '-crf', '18',
-      '-pix_fmt', 'yuv420p',
-      // Duration explicitly set to match expected length
+      '-preset', 'ultrafast', // Faster encoding, larger file potentially
+      '-tune', 'zerolatency', // Good for fast encoding, maybe remove if quality suffers
+      '-crf', '18',         // Constant Rate Factor (lower = better quality, larger size)
+      '-pix_fmt', 'yuv420p', // Pixel format for compatibility
+      // Set output duration explicitly
       '-t', `${videoSettings.duration}`,
+      // Output file name
       outputFile
     ])
   } catch (e) {
-    console.error('FFmpeg error:', e)
-    // Try with simpler settings
-    await ffmpeg.exec([
-      '-f', 'concat', 
-      '-safe', '0',
-      '-i', 'input.txt',
-      '-r', `${fps}`,
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '20',
-      '-pix_fmt', 'yuv420p',
-      outputFile
-    ])
+    console.error('FFmpeg error during primary encoding attempt:', e)
+    console.log('Trying fallback encoding settings...')
+    // Fallback attempt with potentially more compatible settings
+    try {
+      await ffmpeg.exec([
+        // *** Specify input framerate BEFORE input for image sequences ***
+        '-framerate', `${fps}`,
+        // *** Input using image2 pattern matching frame names ***
+        '-i', `frame_%05d.jpg`,
+        // Output frame rate
+        '-r', `${fps}`,
+        // Video codec settings (slightly slower preset, potentially better)
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '20',         // Slightly higher CRF (lower quality, smaller size)
+        '-pix_fmt', 'yuv420p',
+        // Set output duration explicitly
+        '-t', `${videoSettings.duration}`,
+        // Output file name
+        outputFile
+      ])
+    } catch (fallbackError) {
+        console.error('FFmpeg error during fallback encoding attempt:', fallbackError);
+        // Handle the failure - maybe show an error message to the user
+        recordingStats.status = 'error'; // Indicate error state
+        isRecording.value = false;
+        // Potentially clean up frames even on failure
+        // ... (cleanup logic) ...
+        return; // Stop execution here
+    }
   }
-  
+
   console.log('Video encoding complete, now reading file')
-  
+
   // Read output file
-  const data = await ffmpeg.readFile(outputFile)
+  const data = await ffmpeg.readFile(outputFile).catch(err => {
+      console.error('Error reading encoded file:', err);
+      recordingStats.status = 'error';
+      isRecording.value = false;
+      return null; // Indicate failure
+  });
+
+  if (!data) return; // Stop if reading failed
+
   const buffer = new Uint8Array(data.buffer).slice(0)
-  
+
   // Create blob and URL
   const blob = new Blob([buffer], { type: 'video/mp4' })
   const url = URL.createObjectURL(blob)
-  
+
   console.log('Video ready, blob URL created, size:', buffer.length)
-  
-  // Clean up files
-  const cleanupFiles = await ffmpeg.listDir('.').catch(() => [])
-  for (const file of cleanupFiles) {
-    if (file.name.startsWith('frame_') || file.name === 'input.txt' || file.name === outputFile) {
-      await ffmpeg.deleteFile(file.name).catch(() => {})
+
+  // Clean up frame files and output file from FFmpeg's virtual file system
+  try {
+    const cleanupFiles = await ffmpeg.listDir('.').catch(() => [])
+    for (const file of cleanupFiles) {
+      if (file.name.startsWith('frame_') || file.name === outputFile) {
+        await ffmpeg.deleteFile(file.name).catch((err) => console.warn(`Failed to delete ${file.name}:`, err));
+      }
     }
+    console.log('Cleaned up temporary frame files.')
+  } catch(err) {
+      console.warn('Could not list or clean up files:', err);
   }
-  
-  // Update UI
-  recordingStats.status = 'ready'
+
+
+  // Update UI state
+  recordingStats.status = 'ready' // Or 'complete'
   downloadUrl.value = url
   isRecording.value = false
-  isPlaying.value = false
+  isPlaying.value = false      // Stop preview playback
   generatedVideo.value = true
-  
+
   // Auto-play the video after a short delay to ensure it's loaded
+  // Ensure videoPlayer ref is available
   setTimeout(() => {
-    if (videoPlayer.value) {
-      videoPlayer.value.load()
-      videoPlayer.value.play().catch(e => console.error('Video play error:', e))
+    const player = videoPlayer.value; // Access the DOM element via .value
+    if (player) {
+      player.load() // Important to load the new source
+      player.play().catch(e => console.error('Video auto-play error:', e))
+    } else {
+        console.warn('Video player element not available for auto-play.')
     }
-  }, 500)
+  }, 500) // Delay might need adjustment
 }
 
 // Function to set aspect ratio and resolution
