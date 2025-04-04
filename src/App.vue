@@ -11,11 +11,12 @@
       </div>
       
       <div v-if="generatedVideo" class="player-container">
-        <video ref="videoPlayer" controls>
-          <source :src="downloadUrl" type="video/webm">
+        <video ref="videoPlayer" controls preload="auto">
+          <source :src="downloadUrl" type="video/mp4">
+          Your browser doesn't support HTML5 video.
         </video>
         <div class="player-controls">
-          <a :href="downloadUrl" download="slideshow.webm">Download Video</a>
+          <a :href="downloadUrl" download="slideshow.mp4" class="download-btn">Download Video</a>
           <button @click="clearVideo">Close</button>
         </div>
       </div>
@@ -24,8 +25,16 @@
         <button @click="startRecording" :disabled="isRecording || slides.length === 0">
           Generate Video
         </button>
-        <div v-if="isRecording" class="progress-bar">
-          <div class="progress" :style="{ width: `${recordingProgress}%` }"></div>
+        <div v-if="isRecording" class="encoding-stats">
+          <div v-if="recordingStats.status === 'capturing'">
+            Captured: {{ recordingStats.capturedFrames }} of {{ recordingStats.totalFrames }} frames
+          </div>
+          <div v-if="recordingStats.status === 'encoding'">
+            Encoding: frame {{ recordingStats.encodingFrame }} | 
+            Time: {{ recordingStats.encodingTime }} | 
+            Size: {{ recordingStats.encodingSize }} | 
+            Speed: {{ recordingStats.encodingSpeed }}
+          </div>
         </div>
       </div>
     </div>
@@ -38,22 +47,55 @@
           <select v-model="videoSettings.fps" :disabled="generatedVideo">
             <option value="24">24</option>
             <option value="30">30</option>
-            <option value="40">40</option>
             <option value="60">60</option>
-            <option value="120">120</option>
           </select>
         </div>
-        <div class="control">
-          <label>Size</label>
-          <div class="size-inputs">
-            <input type="number" placeholder="Width" v-model.number="videoSettings.width" :disabled="generatedVideo" />
-            <span>×</span>
-            <input type="number" placeholder="Height" v-model.number="videoSettings.height" :disabled="generatedVideo" />
+        
+        <div class="aspect-buttons">
+          <label>Aspect Ratio</label>
+          <div class="button-group">
+            <button 
+              :class="{ active: videoSettings.aspectRatio === 'square' }" 
+              @click="setAspectAndSize('square', 500, 500)"
+              :disabled="generatedVideo">
+              Square (1:1)
+            </button>
+            <button 
+              :class="{ active: videoSettings.aspectRatio === 'portrait' }" 
+              @click="setAspectAndSize('portrait', 500, 1000)"
+              :disabled="generatedVideo">
+              Portrait (1:2)
+            </button>
+            <button 
+              :class="{ active: videoSettings.aspectRatio === 'landscape' }" 
+              @click="setAspectAndSize('landscape', 1000, 500)"
+              :disabled="generatedVideo">
+              Landscape (2:1)
+            </button>
           </div>
         </div>
+        
+        <div class="resolution-buttons">
+          <label>Resolution</label>
+          <div class="button-group">
+            <button 
+              :class="{ active: getResolutionClass('low') }" 
+              @click="setResolution('low')"
+              :disabled="generatedVideo">
+              500px
+            </button>
+            <button 
+              :class="{ active: getResolutionClass('high') }" 
+              @click="setResolution('high')"
+              :disabled="generatedVideo">
+              1080px
+            </button>
+          </div>
+        </div>
+        
         <div class="control">
           <label>Duration (seconds)</label>
-          <input type="number" v-model.number="videoSettings.duration" :disabled="generatedVideo" />
+          <input type="number" v-model.number="videoSettings.duration" min="3" max="15" :disabled="generatedVideo" />
         </div>
         <div class="control">
           <label>Transition Time (seconds)</label>
@@ -107,6 +149,13 @@
 
 <script setup>
 import { ref, reactive, onMounted, watch, onUnmounted } from 'vue'
+import { FFmpeg } from '@ffmpeg/ffmpeg'
+import { fetchFile } from '@ffmpeg/util'
+import { drawImageCovered, canvasToBlob, calculateOptimalQuality, getEncodingParams, resizeImageToCover } from './utils.js'
+
+// FFmpeg instance
+const ffmpeg = new FFmpeg()
+const ffmpegLoaded = ref(false)
 
 // Canvas and context
 let canvas, ctx
@@ -115,17 +164,25 @@ let animationFrame = null
 // Group video settings into a single reactive object
 const videoSettings = reactive({
   fps: 60,
-  width: 512,
-  height: 512,
+  width: 500,
+  height: 500,
+  aspectRatio: 'square', // 'square' (1:1), 'landscape' (2:1) or 'portrait' (1:2)
   duration: 5,
   transitionTime: 0.5,
-  // Quality settings - always maximum
-  bitrate: 20000 // kbps (maximum)
+  format: 'mp4' // mp4 only
 })
 
 // Other state variables
 const isRecording = ref(false)
-const recordingProgress = ref(0)
+const recordingStats = reactive({
+  capturedFrames: 0,
+  totalFrames: 0,
+  encodingFrame: 0,
+  encodingTime: '00:00:00',
+  encodingSize: '0KB',
+  encodingSpeed: '0x',
+  status: 'ready'
+})
 const downloadUrl = ref('')
 const slides = ref([])
 const effects = ref([])
@@ -144,7 +201,7 @@ let totalPausedTime = 0
 // ------------------------------------
 // Lifecycle hooks
 // ------------------------------------
-onMounted(() => {
+onMounted(async () => {
   canvas = document.getElementById('preview-canvas')
   ctx = canvas.getContext('2d')
   
@@ -154,6 +211,21 @@ onMounted(() => {
   
   updateCanvasSize()
   addDefaultEffects()
+  
+  // Load FFmpeg
+  try {
+    // Set up log handler to parse progress info
+    ffmpeg.on('log', ({ message }) => {
+      console.log('[FFmpeg]', message)
+      parseFFmpegProgress(message)
+    })
+    
+    await ffmpeg.load()
+    ffmpegLoaded.value = true
+    console.log('FFmpeg loaded')
+  } catch (e) {
+    console.error('Error loading FFmpeg:', e)
+  }
   
   animationFrame = requestAnimationFrame(animate)
 })
@@ -246,12 +318,18 @@ function handleSlideUpload(event) {
     const reader = new FileReader()
     reader.onload = () => {
       const img = new Image()
-      img.onload = () => {
+      img.onload = async () => {
+        // Store the original image for future resizing
+        const originalImg = img
+        
+        // Resize the image to match video dimensions while maintaining aspect ratio
+        const resizedImg = await resizeImageToCover(img, videoSettings.width, videoSettings.height)
+        
         slides.value.push({
-          src: reader.result,
-          img,
-          transition: 'fade', // Default transition is fade
-          // This transition controls how THIS slide will enter the screen
+          src: resizedImg.src, // Use the resized image src
+          img: resizedImg,     // Store the resized image
+          originalImg,         // Keep the original for future resizing
+          transition: 'fade',  // Default transition is fade
         })
       }
       img.src = reader.result
@@ -267,16 +345,31 @@ function handleFxUpload(event) {
     const reader = new FileReader()
     reader.onload = () => {
       const img = new Image()
-      img.onload = () => {
+      img.onload = async () => {
+        // Create a square canvas for the effect at the right size
+        const size = 60
+        const canvas = document.createElement('canvas')
+        canvas.width = size
+        canvas.height = size
+        const ctx = canvas.getContext('2d')
+        
+        // Draw the image properly maintaining aspect ratio
+        drawImageCovered(ctx, img, 0, 0, size, size)
+        
+        // Create a new image from the canvas
+        const resizedImg = new Image()
+        resizedImg.onload = () => {
         effects.value.push({
-          src: reader.result,
-          img,
-          x: Math.random() * (canvas.width - 60),
-          y: Math.random() * (canvas.height - 60),
+            src: resizedImg.src,
+            img: resizedImg,
+            x: Math.random() * (canvas.width - size),
+            y: Math.random() * (canvas.height - size),
           dx: (Math.random() - 0.5) * 4,
           dy: (Math.random() - 0.5) * 4,
-          size: 60
+            size: size
         })
+        }
+        resizedImg.src = canvas.toDataURL('image/png')
       }
       img.src = reader.result
     }
@@ -287,35 +380,6 @@ function handleFxUpload(event) {
 // ------------------------------------
 // Rendering and animation
 // ------------------------------------
-function drawImageCovered(img, x, y, width, height) {
-  if (!img || !img.complete) return;
-  
-  const imgRatio = img.naturalWidth / img.naturalHeight;
-  const targetRatio = width / height;
-  
-  let sw, sh, sx, sy, dw, dh;
-  
-  if (imgRatio > targetRatio) {
-    // Image is wider than target - match heights
-    sh = img.naturalHeight;
-    sw = sh * targetRatio;
-    sx = (img.naturalWidth - sw) / 2;
-    sy = 0;
-  } else {
-    // Image is taller than target - match widths
-    sw = img.naturalWidth;
-    sh = sw / targetRatio;
-    sx = 0;
-    sy = (img.naturalHeight - sh) / 2;
-  }
-  
-  // Destination rectangle
-  dw = width;
-  dh = height;
-  
-  ctx.drawImage(img, sx, sy, sw, sh, x, y, dw, dh);
-}
-
 function animate(timestamp) {
   if (!ctx) return
   
@@ -388,17 +452,17 @@ function animate(timestamp) {
   if (transitionProgress < 1 && slideIndex > 0) {
     // During transition, show previous slide underneath
     const prevSlide = slides.value[prevSlideIndex]
-    drawImageCovered(prevSlide.img, 0, 0, canvas.width, canvas.height)
+    drawImageCovered(ctx, prevSlide.img, 0, 0, canvas.width, canvas.height)
   }
   
   // Draw the current slide based on its transition type
   if (transition === 'none' || transitionProgress === 1) {
     // Just draw the slide at full opacity
-    drawImageCovered(currentSlide.img, 0, 0, canvas.width, canvas.height)
+    drawImageCovered(ctx, currentSlide.img, 0, 0, canvas.width, canvas.height)
   } else if (transition === 'fade') {
     // Fade in
     ctx.globalAlpha = transitionProgress
-    drawImageCovered(currentSlide.img, 0, 0, canvas.width, canvas.height)
+    drawImageCovered(ctx, currentSlide.img, 0, 0, canvas.width, canvas.height)
     ctx.globalAlpha = 1.0
   } else if (transition === 'slide') {
     // Slide in from right
@@ -408,7 +472,7 @@ function animate(timestamp) {
     ctx.beginPath()
     ctx.rect(slideOffset, 0, canvas.width - slideOffset, canvas.height)
     ctx.clip()
-    drawImageCovered(currentSlide.img, 0, 0, canvas.width, canvas.height)
+    drawImageCovered(ctx, currentSlide.img, 0, 0, canvas.width, canvas.height)
     ctx.restore()
   } else if (transition === 'zoom') {
     // Zoom in
@@ -420,11 +484,7 @@ function animate(timestamp) {
     
     ctx.save()
     ctx.globalAlpha = transitionProgress
-    drawImageCovered(
-      currentSlide.img,
-      -offsetX, -offsetY,
-      scaledWidth, scaledHeight
-    )
+    drawImageCovered(ctx, currentSlide.img, -offsetX, -offsetY, scaledWidth, scaledHeight)
     ctx.restore()
   }
   
@@ -435,9 +495,9 @@ function animate(timestamp) {
 }
 
 function animateEffects() {
-  effects.value.forEach(effect => {
-    // Update positions when playing
-    if (isPlaying.value || isRecording.value) {
+  // Only update effect positions when actively playing or recording (not during encoding)
+  if (isPlaying.value || (isRecording.value && recordingStats.status === 'capturing')) {
+    effects.value.forEach(effect => {
       effect.x += effect.dx
       effect.y += effect.dy
       
@@ -451,10 +511,12 @@ function animateEffects() {
         effect.dy *= -1
         effect.y = Math.max(0, Math.min(canvas.height - effect.size, effect.y))
       }
-    }
-    
-    // Draw the effect
-    ctx.drawImage(effect.img, effect.x, effect.y, effect.size, effect.size)
+    })
+  }
+  
+  // Always draw the effects regardless of motion state
+  effects.value.forEach(effect => {
+    drawImageCovered(ctx, effect.img, effect.x, effect.y, effect.size, effect.size)
   })
 }
 
@@ -515,71 +577,281 @@ function addDefaultEffects() {
 // ------------------------------------
 // Video recording
 // ------------------------------------
-function startRecording() {
-  if (isRecording.value || slides.value.length === 0) return
+async function startRecording() {
+  if (isRecording.value || slides.value.length === 0 || !ffmpegLoaded.value) return
+  
+  // Reset and set up recording stats
+  recordingStats.capturedFrames = 0
+  recordingStats.totalFrames = 0
+  recordingStats.encodingFrame = 0
+  recordingStats.encodingTime = '00:00:00'
+  recordingStats.encodingSize = '0KB'
+  recordingStats.encodingSpeed = '0x'
+  recordingStats.status = 'capturing'
   
   // Set up for recording
   isRecording.value = true
-  recordingProgress.value = 0
   isPlaying.value = true  // Start playback for recording
   startTime = Date.now()  // Reset timing
   totalPausedTime = 0
   
-  // Get actual FPS based on transitions
-  // If we have complex transitions, use higher FPS for smoother results
-  const hasComplexTransitions = slides.value.some(slide => 
-    slide.transition === 'slide' || slide.transition === 'zoom'
-  )
-  
-  // For complex transitions, use higher FPS if original setting is low
-  const recordingFps = hasComplexTransitions && videoSettings.fps < 40 
-    ? Math.max(videoSettings.fps, 40) 
-    : videoSettings.fps
-  
-  // Setup recording with quality settings
+  const fps = videoSettings.fps
   const totalDuration = videoSettings.duration * 1000 // ms
-  const stream = canvas.captureStream(recordingFps)
+  const frameInterval = 1000 / fps // ms between frames
+  const totalFrames = Math.ceil(totalDuration / frameInterval)
   
-  // Apply bitrate and codec settings for better quality
-  const recorder = new MediaRecorder(stream, { 
-    mimeType: 'video/webm',
-    videoBitsPerSecond: videoSettings.bitrate * 1000 // convert kbps to bps
-  })
+  // Set total frames in stats
+  recordingStats.totalFrames = totalFrames
   
-  const chunks = []
-  
-  recorder.ondataavailable = e => chunks.push(e.data)
-  recorder.onstop = () => {
-    const blob = new Blob(chunks, { type: 'video/webm' })
-    const url = URL.createObjectURL(blob)
-    downloadUrl.value = url
-    isRecording.value = false
-    isPlaying.value = false
-    generatedVideo.value = true
-    
-    // Auto-play the video when it's ready
-    setTimeout(() => {
-      if (videoPlayer.value) {
-        videoPlayer.value.play()
-      }
-    }, 100)
-  }
-  
+  let frameCount = 0
   let recordingStartTime = Date.now()
   
-  // Start recording
-  recorder.start()
-  
-  const timer = setInterval(() => {
-    const elapsed = Date.now() - recordingStartTime
-    
-    // Update progress
-    recordingProgress.value = Math.min(100, (elapsed / totalDuration) * 100)
-    
-    if (elapsed >= totalDuration) {
-      clearInterval(timer)
-      recorder.stop()
+  // Clear any existing files
+  const files = await ffmpeg.listDir('.').catch(() => [])
+  for (const file of files) {
+    if (file.name.startsWith('frame_') || file.name === 'input.txt' || file.name.startsWith('output.')) {
+      await ffmpeg.deleteFile(file.name).catch(() => {})
     }
-  }, 50) // Update progress about 20 times per second
+  }
+  
+  // Calculate optimal quality for this resolution
+  const quality = calculateOptimalQuality(videoSettings.width, videoSettings.height)
+  
+  // Capture frames one by one
+  const captureFrame = async () => {
+    if (!isRecording.value) return
+    
+    // Get current canvas content as blob with optimal quality
+    const blob = await canvasToBlob(canvas, 'image/jpeg', quality)
+    
+    // Write directly to ffmpeg virtual filesystem
+    const fileName = `frame_${frameCount.toString().padStart(5, '0')}.jpg`
+    await ffmpeg.writeFile(fileName, await fetchFile(blob))
+    
+    frameCount++
+    recordingStats.capturedFrames = frameCount
+    
+    const elapsed = Date.now() - recordingStartTime
+    if (elapsed < totalDuration && isRecording.value) {
+      // Schedule next frame capture
+      setTimeout(captureFrame, frameInterval)
+    } else {
+      // Finished capturing frames, now generate video
+      recordingStats.status = 'encoding'
+      await encodeVideo(frameCount, fps)
+    }
+  }
+  
+  // Start capturing frames
+  captureFrame()
+}
+
+async function encodeVideo(frameCount, fps) {
+  // Create input.txt for concat demuxer
+  const fileList = Array.from({length: frameCount}, (_, i) => 
+    `file frame_${i.toString().padStart(5, '0')}.jpg`
+  ).join('\n')
+  
+  await ffmpeg.writeFile('input.txt', fileList)
+  
+  recordingStats.status = 'encoding'
+  console.log(`Encoding ${frameCount} frames at ${fps} FPS`)
+  
+  const outputFile = 'output.mp4'
+  
+  // Try first with high quality settings
+  try {
+    await ffmpeg.exec([
+      '-f', 'concat', 
+      '-safe', '0',
+      '-i', 'input.txt',
+      '-r', `${fps}`, 
+      '-vsync', 'cfr', 
+      '-c:v', 'libx264',
+      '-profile:v', 'high',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-crf', '18',
+      '-b:v', '25M',
+      '-maxrate', '35M',
+      '-bufsize', '50M',
+      '-pix_fmt', 'yuv420p',
+      outputFile
+    ])
+  } catch (e) {
+    // If that fails, try with simpler settings
+    console.log('Using fallback encoding settings')
+    await ffmpeg.exec([
+      '-f', 'concat', 
+      '-safe', '0',
+      '-i', 'input.txt',
+      '-r', `${fps}`,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '20',
+      '-pix_fmt', 'yuv420p',
+      outputFile
+    ])
+  }
+  
+  console.log('Video encoding complete, now reading file')
+  
+  // Read output file
+  const data = await ffmpeg.readFile(outputFile)
+  const buffer = new Uint8Array(data.buffer).slice(0)
+  
+  // Create blob and URL
+  const blob = new Blob([buffer], { type: 'video/mp4' })
+  const url = URL.createObjectURL(blob)
+  
+  console.log('Video ready, blob URL created, size:', buffer.length)
+  
+  // Clean up files
+  const cleanupFiles = await ffmpeg.listDir('.').catch(() => [])
+  for (const file of cleanupFiles) {
+    if (file.name.startsWith('frame_') || file.name === 'input.txt' || file.name === outputFile) {
+      await ffmpeg.deleteFile(file.name).catch(() => {})
+    }
+  }
+  
+  // Update UI
+  recordingStats.status = 'ready'
+  downloadUrl.value = url
+  isRecording.value = false
+  isPlaying.value = false
+  generatedVideo.value = true
+  
+  // Auto-play the video after a short delay to ensure it's loaded
+  setTimeout(() => {
+    if (videoPlayer.value) {
+      videoPlayer.value.load()
+      videoPlayer.value.play().catch(e => console.error('Video play error:', e))
+    }
+  }, 500)
+}
+
+// Function to set aspect ratio and resolution
+async function setAspectAndSize(aspect, width, height) {
+  videoSettings.aspectRatio = aspect
+  videoSettings.width = width
+  videoSettings.height = height
+  updateCanvasSize()
+  
+  // Resize all existing slides to match new dimensions
+  if (slides.value.length > 0) {
+    // Create temporary array to hold new slides
+    const newSlides = []
+    
+    // Process each slide to match new dimensions
+    for (const slide of slides.value) {
+      // Get the original image if available, or use current one
+      const sourceImg = slide.originalImg || slide.img
+      
+      // Resize the image to new dimensions
+      const resizedImg = await resizeImageToCover(sourceImg, width, height)
+      
+      // Add to new slides with original transition
+      newSlides.push({
+        src: resizedImg.src,
+        img: resizedImg,
+        originalImg: sourceImg, // Store original for future resizing
+        transition: slide.transition
+      })
+    }
+    
+    // Replace slides with resized versions
+    slides.value = newSlides
+  }
+  
+  // Reset and regenerate FX elements to match new dimensions
+  resetEffects()
+}
+
+// Function to reset and regenerate FX elements
+function resetEffects() {
+  // Clear existing effects
+  effects.value = []
+  
+  // Add default effects matching new dimensions
+  addDefaultEffects()
+}
+
+// Function to set resolution based on aspect ratio
+function setResolution(resolution) {
+  if (videoSettings.aspectRatio === 'square') {
+    // For square: width = height
+    if (resolution === 'low') {
+      videoSettings.width = 500
+      videoSettings.height = 500
+    } else {
+      videoSettings.width = 1080
+      videoSettings.height = 1080
+    }
+  } else if (videoSettings.aspectRatio === 'portrait') {
+    // For portrait: height is the primary dimension
+    if (resolution === 'low') {
+      videoSettings.height = 1000
+      videoSettings.width = 500
+    } else {
+      videoSettings.height = 2160
+      videoSettings.width = 1080
+    }
+  } else {
+    // For landscape: width is the primary dimension
+    if (resolution === 'low') {
+      videoSettings.width = 1000
+      videoSettings.height = 500
+    } else {
+      videoSettings.width = 2160
+      videoSettings.height = 1080
+    }
+  }
+  updateCanvasSize()
+}
+
+// Helper to determine if resolution button should be active
+function getResolutionClass(resolution) {
+  const isPortrait = videoSettings.aspectRatio === 'portrait'
+  const primaryDimension = isPortrait ? videoSettings.height : videoSettings.width
+  
+  if (resolution === 'low') {
+    return primaryDimension <= 500
+  } else {
+    return primaryDimension > 500
+  }
+}
+
+// Add function to parse FFmpeg logs for progress information
+function parseFFmpegProgress(message) {
+  // Only parse progress messages
+  if (!message.includes('frame=')) return
+  
+  try {
+    // Extract frame number
+    const frameMatch = message.match(/frame=\s*(\d+)/)
+    if (frameMatch && frameMatch[1]) {
+      recordingStats.encodingFrame = parseInt(frameMatch[1])
+    }
+    
+    // Extract encoding time
+    const timeMatch = message.match(/time=(\d+:\d+:\d+\.\d+)/)
+    if (timeMatch && timeMatch[1]) {
+      recordingStats.encodingTime = timeMatch[1]
+    }
+    
+    // Extract file size
+    const sizeMatch = message.match(/size=\s*(\d+kB)/)
+    if (sizeMatch && sizeMatch[1]) {
+      recordingStats.encodingSize = sizeMatch[1]
+    }
+    
+    // Extract speed
+    const speedMatch = message.match(/speed=\s*(\d+\.\d+x)/)
+    if (speedMatch && speedMatch[1]) {
+      recordingStats.encodingSpeed = speedMatch[1]
+    }
+  } catch (e) {
+    console.error('Error parsing FFmpeg progress:', e)
+  }
 }
 </script>
