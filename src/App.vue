@@ -163,7 +163,7 @@ let animationFrame = null
 
 // Group video settings into a single reactive object
 const videoSettings = reactive({
-  fps: 60,
+  fps: 30,
   width: 500,
   height: 500,
   aspectRatio: 'square', // 'square' (1:1), 'landscape' (2:1) or 'portrait' (1:2)
@@ -387,61 +387,42 @@ function animate(timestamp) {
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
   
+  // Calculate elapsed time for animations
+  let elapsed = 0
+  
+  if (isPlaying.value) {
+    // Calculate elapsed time accounting for pauses
+    elapsed = Date.now() - startTime - totalPausedTime
+    
+    // Cap at total duration
+    if (elapsed >= videoSettings.duration * 1000) {
+      elapsed = videoSettings.duration * 1000 - 10 // Just before end
+      isPlaying.value = false
+    }
+  }
+  
+  // Use time-based animation for consistent FX movement
+  renderFrameAtTime(elapsed)
+  
+  // Continue animation loop
+  animationFrame = requestAnimationFrame(animate)
+}
+
+// Render a frame at a specific time point (used by both preview and recording)
+function renderFrameAtTime(timeMs) {
   // Clear canvas with background color
   ctx.fillStyle = backgroundColor.value
   ctx.fillRect(0, 0, canvas.width, canvas.height)
   
   // If no slides, just show a blank canvas with background
-  if (slides.value.length === 0) {
-    animationFrame = requestAnimationFrame(animate)
-    return
-  }
+  if (slides.value.length === 0) return
+    
+  // Calculate animation state at this time
+  const { slideIndex, prevSlideIndex, transitionProgress } = calculateAnimationState(timeMs)
   
-  // Initialize slide variables
-  let slideIndex = currentSlideIndex.value
-  let prevSlideIndex = Math.max(0, slideIndex - 1)
-  let transitionProgress = slideTransitionProgress.value
-  
-  // Draw current slide and handle transitions
-  if (isPlaying.value) {
-    // Calculate elapsed time accounting for pauses
-    let elapsed = Date.now() - startTime - totalPausedTime
-    
-    // Calculate slide timing
-    const slideDisplayMs = (videoSettings.duration * 1000) / slides.value.length
-    const transitionMs = videoSettings.transitionTime * 1000
-    
-    // Get current slide index
-    slideIndex = Math.min(
-      Math.floor(elapsed / slideDisplayMs),
-      slides.value.length - 1
-    )
-    
-    prevSlideIndex = Math.max(0, slideIndex - 1)
-    
-    // Calculate transition progress
-    let slideStartTime = slideIndex * slideDisplayMs
-    let slideElapsed = elapsed - slideStartTime
-    
-    // Transition happens at the BEGINNING of the slide display time
-    if (slideElapsed < transitionMs) {
-      transitionProgress = slideElapsed / transitionMs
-    } else {
-      transitionProgress = 1 // Transition complete
-    }
-    
-    // Stop at the end of the slides
-    if (elapsed >= videoSettings.duration * 1000) {
-      isPlaying.value = false
-      slideIndex = slides.value.length - 1
-      prevSlideIndex = slideIndex - 1
-      transitionProgress = 1
-    }
-    
-    // Update reactive state
-    currentSlideIndex.value = slideIndex
-    slideTransitionProgress.value = transitionProgress
-  }
+  // Update reactive state (for UI)
+  currentSlideIndex.value = slideIndex
+  slideTransitionProgress.value = transitionProgress
   
   // Get the current slide
   const currentSlide = slides.value[slideIndex]
@@ -488,36 +469,70 @@ function animate(timestamp) {
     ctx.restore()
   }
   
-  // Animate effects
-  animateEffects()
+  // Position FX elements based on time
+  positionEffectsAtTime(timeMs)
   
-  animationFrame = requestAnimationFrame(animate)
-}
-
-function animateEffects() {
-  // Only update effect positions when actively playing or recording (not during encoding)
-  if (isPlaying.value || (isRecording.value && recordingStats.status === 'capturing')) {
-    effects.value.forEach(effect => {
-      effect.x += effect.dx
-      effect.y += effect.dy
-      
-      // Bounce off edges
-      if (effect.x <= 0 || effect.x + effect.size >= canvas.width) {
-        effect.dx *= -1
-        effect.x = Math.max(0, Math.min(canvas.width - effect.size, effect.x))
-      }
-      
-      if (effect.y <= 0 || effect.y + effect.size >= canvas.height) {
-        effect.dy *= -1
-        effect.y = Math.max(0, Math.min(canvas.height - effect.size, effect.y))
-      }
-    })
-  }
-  
-  // Always draw the effects regardless of motion state
+  // Draw all effects at their current positions
   effects.value.forEach(effect => {
     drawImageCovered(ctx, effect.img, effect.x, effect.y, effect.size, effect.size)
   })
+}
+
+// Calculate slide index and transition progress at a specific time
+function calculateAnimationState(timeMs) {
+  // Calculate slide timing - make sure to reserve time for the last slide
+  const slideCount = slides.value.length
+  const slideDisplayMs = videoSettings.duration * 1000 / slideCount
+  const transitionMs = videoSettings.transitionTime * 1000
+  
+  // Ensure the last slide gets full time by adjusting the cutoff
+  // Get current slide index with adjusted calculation
+  const slideIndex = Math.min(
+    Math.floor(timeMs / slideDisplayMs),
+    slideCount - 1
+  )
+  
+  const prevSlideIndex = Math.max(0, slideIndex - 1)
+  
+  // Calculate transition progress
+  const slideStartTime = slideIndex * slideDisplayMs
+  const slideElapsed = timeMs - slideStartTime
+  
+  // Transition happens at the BEGINNING of the slide display time
+  let transitionProgress
+  if (slideElapsed < transitionMs) {
+    transitionProgress = slideElapsed / transitionMs
+  } else {
+    transitionProgress = 1 // Transition complete
+  }
+  
+  return { slideIndex, prevSlideIndex, transitionProgress }
+}
+
+// Position FX elements using time-based periodic functions
+function positionEffectsAtTime(timeMs) {
+  // Only update positions during active playback or when capturing frames
+  if (isRecording.value || isPlaying.value) {
+    const timeFactorSec = timeMs / 1000 // Convert to seconds for smoother animation
+    
+    effects.value.forEach((effect, index) => {
+      // Use different factors for different effects
+      const speedX = index === 0 ? 0.8 : 0.6
+      const speedY = index === 0 ? 0.5 : 0.7
+      const amplitudeX = index === 0 ? 100 : 80
+      const amplitudeY = index === 0 ? 80 : 100
+      const offsetX = index === 0 ? 100 : 200
+      const offsetY = index === 0 ? 100 : 200
+      
+      // Calculate positions using periodic functions
+      effect.x = offsetX + Math.sin(timeFactorSec * speedX) * amplitudeX
+      effect.y = offsetY + Math.cos(timeFactorSec * speedY) * amplitudeY
+      
+      // Ensure within bounds
+      effect.x = Math.max(0, Math.min(canvas.width - effect.size, effect.x))
+      effect.y = Math.max(0, Math.min(canvas.height - effect.size, effect.y))
+    })
+  }
 }
 
 // ------------------------------------
@@ -591,59 +606,67 @@ async function startRecording() {
   
   // Set up for recording
   isRecording.value = true
-  isPlaying.value = true  // Start playback for recording
-  startTime = Date.now()  // Reset timing
-  totalPausedTime = 0
   
-  const fps = videoSettings.fps
-  const totalDuration = videoSettings.duration * 1000 // ms
-  const frameInterval = 1000 / fps // ms between frames
-  const totalFrames = Math.ceil(totalDuration / frameInterval)
+  const fps = parseInt(videoSettings.fps, 10)  // Ensure fps is a number
+  const durationMs = videoSettings.duration * 1000
+  
+  // Calculate exact number of frames needed
+  const totalFrames = Math.ceil(fps * (durationMs / 1000))
+  
+  console.log(`Recording ${totalFrames} frames at ${fps}fps for ${durationMs}ms duration`)
   
   // Set total frames in stats
   recordingStats.totalFrames = totalFrames
   
-  let frameCount = 0
-  let recordingStartTime = Date.now()
-  
   // Clear any existing files
-  const files = await ffmpeg.listDir('.').catch(() => [])
-  for (const file of files) {
-    if (file.name.startsWith('frame_') || file.name === 'input.txt' || file.name.startsWith('output.')) {
-      await ffmpeg.deleteFile(file.name).catch(() => {})
+  try {
+    const files = await ffmpeg.listDir('.').catch(() => [])
+    for (const file of files) {
+      if (file.name.startsWith('frame_') || file.name === 'input.txt' || file.name.startsWith('output.')) {
+        await ffmpeg.deleteFile(file.name).catch(() => {})
+      }
     }
+  } catch (err) {
+    console.log('Error clearing files:', err)
   }
   
   // Calculate optimal quality for this resolution
   const quality = calculateOptimalQuality(videoSettings.width, videoSettings.height)
   
-  // Capture frames one by one
-  const captureFrame = async () => {
-    if (!isRecording.value) return
-    
-    // Get current canvas content as blob with optimal quality
-    const blob = await canvasToBlob(canvas, 'image/jpeg', quality)
-    
-    // Write directly to ffmpeg virtual filesystem
-    const fileName = `frame_${frameCount.toString().padStart(5, '0')}.jpg`
-    await ffmpeg.writeFile(fileName, await fetchFile(blob))
-    
-    frameCount++
-    recordingStats.capturedFrames = frameCount
-    
-    const elapsed = Date.now() - recordingStartTime
-    if (elapsed < totalDuration && isRecording.value) {
-      // Schedule next frame capture
-      setTimeout(captureFrame, frameInterval)
-    } else {
-      // Finished capturing frames, now generate video
-      recordingStats.status = 'encoding'
-      await encodeVideo(frameCount, fps)
+  try {
+    // Generate all frames at exact time points
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+      // Calculate the exact time this frame represents
+      const frameTimeMs = (frameIndex / fps) * 1000
+      
+      // Render the frame at this exact time point
+      renderFrameAtTime(frameTimeMs)
+      
+      // Capture the frame
+      const blob = await canvasToBlob(canvas, 'image/jpeg', quality)
+      const fileName = `frame_${frameIndex.toString().padStart(5, '0')}.jpg`
+      await ffmpeg.writeFile(fileName, await fetchFile(blob))
+      
+      // Update stats
+      recordingStats.capturedFrames = frameIndex + 1
+      
+      // Give the UI a chance to update occasionally
+      if (frameIndex % 10 === 0) {
+        await new Promise(r => setTimeout(r, 0))
+      }
+      
+      // Check if recording was cancelled
+      if (!isRecording.value) return
     }
+    
+    // Finished capturing frames, now generate video
+    recordingStats.status = 'encoding'
+    await encodeVideo(totalFrames, fps)
+  } catch (err) {
+    console.error('Error during frame capture:', err)
+    isRecording.value = false
+    recordingStats.status = 'ready'
   }
-  
-  // Start capturing frames
-  captureFrame()
 }
 
 async function encodeVideo(frameCount, fps) {
@@ -659,28 +682,29 @@ async function encodeVideo(frameCount, fps) {
   
   const outputFile = 'output.mp4'
   
-  // Try first with high quality settings
   try {
+    // Use more explicit timing controls for FFmpeg
     await ffmpeg.exec([
       '-f', 'concat', 
       '-safe', '0',
       '-i', 'input.txt',
-      '-r', `${fps}`, 
-      '-vsync', 'cfr', 
+      // Force exact framerate with CFR
+      '-framerate', `${fps}`,
+      '-r', `${fps}`,
+      '-vsync', 'cfr',
       '-c:v', 'libx264',
       '-profile:v', 'high',
       '-preset', 'ultrafast',
       '-tune', 'zerolatency',
       '-crf', '18',
-      '-b:v', '25M',
-      '-maxrate', '35M',
-      '-bufsize', '50M',
       '-pix_fmt', 'yuv420p',
+      // Duration explicitly set to match expected length
+      '-t', `${videoSettings.duration}`,
       outputFile
     ])
   } catch (e) {
-    // If that fails, try with simpler settings
-    console.log('Using fallback encoding settings')
+    console.error('FFmpeg error:', e)
+    // Try with simpler settings
     await ffmpeg.exec([
       '-f', 'concat', 
       '-safe', '0',
